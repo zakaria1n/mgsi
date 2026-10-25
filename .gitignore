@@ -22,9 +22,16 @@ out/
 .next/
 *.tsbuildinfo
 
-# Uploads & local media (avoid uploading 150MB+ user audio files)
-backend/uploads/*
-!backend/uploads/.gitkeep
+# Uploads, local media & audio files (strictly local)
+uploads/
+backend/uploads/
+*.webm
+*.ogg
+*.wav
+*.mp3
+*.m4a
+*.aac
+*.flac
 
 # Android build outputs & local config
 frontend/android/.gradle/
