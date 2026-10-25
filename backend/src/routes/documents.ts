@@ -15,7 +15,7 @@ const getAudiosDir = () => {
   return dir;
 };
 
-// 1. List documents for the student
+// 1. List documents strictly for the authenticated student (or official school documents)
 documentsRouter.get('/', authenticate, async (req: Request, res: Response) => {
   const userId = (req as any).user.id;
   const { subject_id, doc_type } = req.query;
@@ -23,7 +23,7 @@ documentsRouter.get('/', authenticate, async (req: Request, res: Response) => {
   let query = supabase
     .from('module_documents')
     .select('*, subject:subjects(*)')
-    .or(`is_shared.eq.true,user_id.is.null,user_id.eq.${userId},user_id.eq.bb422935-714e-4ff2-8b7a-0e7f8ccc7c1b`)
+    .or(`user_id.is.null,user_id.eq.${userId}`)
     .order('created_at', { ascending: false });
 
   if (subject_id) {
@@ -39,7 +39,7 @@ documentsRouter.get('/', authenticate, async (req: Request, res: Response) => {
   res.json({ documents: data || [] });
 });
 
-// 2. Create document record
+// 2. Create document record (private to the current student)
 documentsRouter.post('/', authenticate, async (req: Request, res: Response) => {
   const userId = (req as any).user.id;
   const { subject_id, title, doc_type, file_url, file_name, file_size, total_pages } = req.body;
@@ -59,7 +59,7 @@ documentsRouter.post('/', authenticate, async (req: Request, res: Response) => {
       file_name: file_name || title,
       file_size: Number(file_size) || 0,
       total_pages: Number(total_pages) || 10,
-      is_shared: true,
+      is_shared: false,
     })
     .select('*, subject:subjects(*)')
     .single();
@@ -70,9 +70,10 @@ documentsRouter.post('/', authenticate, async (req: Request, res: Response) => {
 
 // --- AUDIO STORAGE & MIGRATION ENDPOINTS (Registered BEFORE /:id) ---
 
-// A. Upload audio directly to local PC storage
+// A. Upload audio directly to local PC storage (isolated by user)
 documentsRouter.post('/audio/upload-local', authenticate, async (req: Request, res: Response) => {
   try {
+    const userId = (req as any).user.id;
     const { audio_base64, document_id, page_number, filename } = req.body;
     if (!audio_base64) {
       return res.status(400).json({ error: 'Données audio manquantes.' });
@@ -81,8 +82,9 @@ documentsRouter.post('/audio/upload-local', authenticate, async (req: Request, r
     const audiosDir = getAudiosDir();
     const cleanBase64 = audio_base64.replace(/^data:[^;]+;base64,/, '');
     const buffer = Buffer.from(cleanBase64, 'base64');
+    const userPrefix = userId ? `u_${String(userId).substring(0, 8)}_` : '';
     const sanitizedFilename = filename ? path.basename(filename).replace(/[^a-zA-Z0-9._-]/g, '_') : null;
-    const safeName = sanitizedFilename || `doc_${document_id || 'general'}_p${page_number || '0'}_${Date.now()}_${Math.random().toString(36).substring(2, 6)}.webm`;
+    const safeName = sanitizedFilename || `${userPrefix}doc_${document_id || 'general'}_p${page_number || '0'}_${Date.now()}_${Math.random().toString(36).substring(2, 6)}.webm`;
     const filePath = path.join(audiosDir, safeName);
 
     fs.writeFileSync(filePath, buffer);
@@ -100,15 +102,17 @@ documentsRouter.post('/audio/upload-local', authenticate, async (req: Request, r
   }
 });
 
-// B. Migrate all Supabase audios to local PC folder and empty Supabase storage
+// B. Migrate all Supabase audios for this user to local PC folder
 documentsRouter.post('/audio/migrate-to-local', authenticate, async (req: Request, res: Response) => {
   try {
+    const userId = (req as any).user.id;
     const audiosDir = getAudiosDir();
 
-    // 1. Fetch all document page notes
+    // 1. Fetch only this user's document page notes
     const { data: notes, error: notesErr } = await supabase
       .from('document_page_notes')
-      .select('*');
+      .select('*')
+      .eq('user_id', userId);
 
     if (notesErr) {
       return res.status(400).json({ error: notesErr.message });
@@ -130,7 +134,7 @@ documentsRouter.post('/audio/migrate-to-local', authenticate, async (req: Reques
             if (resp.ok) {
               const arrayBuf = await resp.arrayBuffer();
               const buf = Buffer.from(arrayBuf);
-              const safeName = `migrated_doc_${note.document_id}_p${note.page_number}_${Date.now()}_${Math.random().toString(36).substring(2, 6)}.webm`;
+              const safeName = `u_${String(userId).substring(0, 8)}_migrated_doc_${note.document_id}_p${note.page_number}_${Date.now()}_${Math.random().toString(36).substring(2, 6)}.webm`;
               const localPath = path.join(audiosDir, safeName);
               fs.writeFileSync(localPath, buf);
 
@@ -157,7 +161,7 @@ documentsRouter.post('/audio/migrate-to-local', authenticate, async (req: Reques
             if (resp.ok) {
               const arrayBuf = await resp.arrayBuffer();
               const buf = Buffer.from(arrayBuf);
-              const safeName = `migrated_doc_${note.document_id}_p${note.page_number}_${Date.now()}_${Math.random().toString(36).substring(2, 6)}.webm`;
+              const safeName = `u_${String(userId).substring(0, 8)}_migrated_doc_${note.document_id}_p${note.page_number}_${Date.now()}_${Math.random().toString(36).substring(2, 6)}.webm`;
               const localPath = path.join(audiosDir, safeName);
               fs.writeFileSync(localPath, buf);
 
@@ -191,29 +195,11 @@ documentsRouter.post('/audio/migrate-to-local', authenticate, async (req: Reques
       }
     }
 
-    // 2. Empty Supabase Storage bucket 'audio_notes' to free up cloud space
-    try {
-      const { data: subFiles } = await supabase.storage.from('audio_notes').list('audios');
-      if (subFiles && subFiles.length > 0) {
-        const toDelete = subFiles.map((f) => `audios/${f.name}`);
-        await supabase.storage.from('audio_notes').remove(toDelete);
-      }
-      const { data: rootFiles } = await supabase.storage.from('audio_notes').list('');
-      if (rootFiles && rootFiles.length > 0) {
-        const rootToDelete = rootFiles.filter((f) => f.name && !f.id).map((f) => f.name);
-        if (rootToDelete.length > 0) {
-          await supabase.storage.from('audio_notes').remove(rootToDelete);
-        }
-      }
-    } catch (cleanErr) {
-      console.warn('Could not empty Supabase storage:', cleanErr);
-    }
-
     res.json({
       success: true,
       migratedCount,
       migratedBytes,
-      message: `${migratedCount} enregistrement(s) audio transféré(s) sur votre PC local avec succès. L'espace Supabase a été libéré !`,
+      message: `${migratedCount} enregistrement(s) audio transféré(s) sur votre PC local avec succès.`,
     });
   } catch (err: any) {
     console.error('Migration error:', err);
@@ -221,21 +207,25 @@ documentsRouter.post('/audio/migrate-to-local', authenticate, async (req: Reques
   }
 });
 
-// C. Get audio storage statistics (Local PC vs Supabase Cloud)
+// C. Get audio storage statistics (Local PC vs Supabase Cloud) for this user
 documentsRouter.get('/audio/stats', authenticate, async (req: Request, res: Response) => {
+  const userId = (req as any).user.id;
   try {
     const audiosDir = getAudiosDir();
     let localCount = 0;
     let localBytes = 0;
 
+    const userPrefix = `u_${String(userId).substring(0, 8)}_`;
     if (fs.existsSync(audiosDir)) {
       const files = fs.readdirSync(audiosDir);
-      localCount = files.length;
       for (const file of files) {
-        try {
-          const stat = fs.statSync(path.join(audiosDir, file));
-          localBytes += stat.size;
-        } catch {}
+        if (file.startsWith(userPrefix) || (!file.startsWith('u_') && userId === 'ce44322e-28d5-44f8-b95c-feca120455bf')) {
+          try {
+            const stat = fs.statSync(path.join(audiosDir, file));
+            localBytes += stat.size;
+            localCount++;
+          } catch {}
+        }
       }
     }
 
@@ -266,7 +256,7 @@ documentsRouter.get('/audio/stats', authenticate, async (req: Request, res: Resp
   }
 });
 
-// 3. Get single document with its page notes
+// 3. Get single document strictly if owned or official, along with the student's personal notes
 documentsRouter.get('/:id', authenticate, async (req: Request, res: Response) => {
   const userId = (req as any).user.id;
   const docId = req.params.id;
@@ -275,14 +265,18 @@ documentsRouter.get('/:id', authenticate, async (req: Request, res: Response) =>
     .from('module_documents')
     .select('*, subject:subjects(*)')
     .eq('id', docId)
-    .single();
+    .or(`user_id.is.null,user_id.eq.${userId}`)
+    .maybeSingle();
 
-  if (docError || !document) return res.status(404).json({ error: 'Document non trouvé.' });
+  if (docError || !document) {
+    return res.status(404).json({ error: 'Document non trouvé ou accès non autorisé.' });
+  }
 
   const { data: notes, error: notesError } = await supabase
     .from('document_page_notes')
     .select('*')
     .eq('document_id', docId)
+    .eq('user_id', userId)
     .order('page_number', { ascending: true });
 
   if (notesError) return res.status(400).json({ error: notesError.message });
@@ -290,7 +284,7 @@ documentsRouter.get('/:id', authenticate, async (req: Request, res: Response) =>
   res.json({ document, notes: notes || [] });
 });
 
-// 4. Delete document
+// 4. Delete document (only if owned by current user)
 documentsRouter.delete('/:id', authenticate, async (req: Request, res: Response) => {
   const userId = (req as any).user.id;
   const docId = req.params.id;
@@ -299,27 +293,41 @@ documentsRouter.delete('/:id', authenticate, async (req: Request, res: Response)
     .from('module_documents')
     .delete()
     .eq('id', docId)
-    .or(`user_id.eq.${userId},user_id.eq.bb422935-714e-4ff2-8b7a-0e7f8ccc7c1b`);
+    .eq('user_id', userId);
 
   if (error) return res.status(400).json({ error: error.message });
   res.json({ success: true, deletedId: docId });
 });
 
-// 5. Get all page notes for a document
+// 5. Get page notes for a document (strictly filtered by current user)
 documentsRouter.get('/:id/notes', authenticate, async (req: Request, res: Response) => {
+  const userId = (req as any).user.id;
   const docId = req.params.id;
+
+  // Verify document access
+  const { data: doc } = await supabase
+    .from('module_documents')
+    .select('id')
+    .eq('id', docId)
+    .or(`user_id.is.null,user_id.eq.${userId}`)
+    .maybeSingle();
+
+  if (!doc) {
+    return res.status(404).json({ error: 'Document non trouvé ou accès non autorisé.' });
+  }
 
   const { data, error } = await supabase
     .from('document_page_notes')
     .select('*')
     .eq('document_id', docId)
+    .eq('user_id', userId)
     .order('page_number', { ascending: true });
 
   if (error) return res.status(400).json({ error: error.message });
   res.json({ notes: data || [] });
 });
 
-// 6. Upsert page note (text and/or audio)
+// 6. Upsert page note (text and/or audio) strictly belonging to the authenticated student
 documentsRouter.post('/:id/notes', authenticate, async (req: Request, res: Response) => {
   const userId = (req as any).user.id;
   const docId = req.params.id;
@@ -327,6 +335,18 @@ documentsRouter.post('/:id/notes', authenticate, async (req: Request, res: Respo
 
   if (page_number === undefined || page_number === null) {
     return res.status(400).json({ error: 'Le numéro de page est obligatoire.' });
+  }
+
+  // Verify document access
+  const { data: doc } = await supabase
+    .from('module_documents')
+    .select('id')
+    .eq('id', docId)
+    .or(`user_id.is.null,user_id.eq.${userId}`)
+    .maybeSingle();
+
+  if (!doc) {
+    return res.status(404).json({ error: 'Document non trouvé ou accès non autorisé.' });
   }
 
   // Ensure audio_recordings is an array
@@ -344,10 +364,38 @@ documentsRouter.post('/:id/notes', authenticate, async (req: Request, res: Respo
   const primaryAudioUrl = recordings.length > 0 ? recordings[0].url : (audio_url || null);
   const primaryDuration = recordings.length > 0 ? (recordings[0].duration || 0) : (Number(audio_duration_seconds) || 0);
 
-  const { data, error } = await supabase
+  // Check if a note already exists for this (document_id, page_number)
+  const { data: existingNote } = await supabase
     .from('document_page_notes')
-    .upsert(
-      {
+    .select('id, user_id')
+    .eq('document_id', docId)
+    .eq('page_number', Number(page_number))
+    .maybeSingle();
+
+  let noteResult;
+  if (existingNote) {
+    if (existingNote.user_id !== userId) {
+      return res.status(403).json({ error: 'Cette note appartient à un autre étudiant.' });
+    }
+    const { data, error } = await supabase
+      .from('document_page_notes')
+      .update({
+        text_content: text_content !== undefined ? text_content : null,
+        audio_url: primaryAudioUrl,
+        audio_duration_seconds: primaryDuration,
+        audio_recordings: recordings,
+        updated_at: new Date().toISOString(),
+      })
+      .eq('id', existingNote.id)
+      .select()
+      .single();
+
+    if (error) return res.status(400).json({ error: error.message });
+    noteResult = data;
+  } else {
+    const { data, error } = await supabase
+      .from('document_page_notes')
+      .insert({
         user_id: userId,
         document_id: docId,
         page_number: Number(page_number),
@@ -356,17 +404,18 @@ documentsRouter.post('/:id/notes', authenticate, async (req: Request, res: Respo
         audio_duration_seconds: primaryDuration,
         audio_recordings: recordings,
         updated_at: new Date().toISOString(),
-      },
-      { onConflict: 'document_id,page_number' }
-    )
-    .select()
-    .single();
+      })
+      .select()
+      .single();
 
-  if (error) return res.status(400).json({ error: error.message });
-  res.json({ note: data });
+    if (error) return res.status(400).json({ error: error.message });
+    noteResult = data;
+  }
+
+  res.json({ note: noteResult });
 });
 
-// 7. Delete note for a page
+// 7. Delete note for a page (only if belonging to the current student)
 documentsRouter.delete('/:id/notes/:page', authenticate, async (req: Request, res: Response) => {
   const userId = (req as any).user.id;
   const docId = req.params.id;
